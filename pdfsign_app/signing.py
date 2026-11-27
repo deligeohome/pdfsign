@@ -102,6 +102,25 @@ def _unique_field_name(pdf_path: str, base: str = "Signature") -> str:
 
 
 # ------------------------------------------------------------------ signing
+@dataclass
+class Placement:
+    """Where one signature goes: an existing field, or a new box (None box = invisible)."""
+    field_name: str | None
+    page: int = 0
+    box: tuple | None = None
+    frame: bool = True       # draw a frame around a NEW box (False: the page already draws one)
+
+
+def _border(settings: Settings, new_field, frame: bool | None = None) -> int:
+    """auto: frame only for new boxes, not for existing fields or boxes the page already draws."""
+    mode = getattr(settings, "stamp_border", "auto")
+    if mode in ("yes", "true", "1", "on"):
+        return 1
+    if mode in ("no", "false", "0", "off"):
+        return 0
+    return 1 if new_field is not None and frame is not False else 0
+
+
 def _font_usable(path: str, log) -> bool:
     if not os.path.exists(path):
         log(f"Stamp font not found: {path}")
@@ -122,6 +141,7 @@ class SignRequest:
     field_name: str | None = None          # existing empty field, or name for the new one
     page: int = 0                          # 0-based page for a NEW field
     box: tuple | None = None               # (x1, y1, x2, y2) PDF user-space points; None = invisible
+    frame: bool | None = None              # frame around a new box (None = default)
     reason: str = ""
     location: str = ""
     contact: str = ""
@@ -166,7 +186,7 @@ def sign_pdf(req: SignRequest, signer: Signer, settings: Settings, chain: list,
             log("Using the built-in stamp font (Latin only).")
     style = TextStampStyle(stamp_text=settings.stamp_text,
                            timestamp_format=settings.timestamp_format,
-                           text_box_style=text_style, border_width=1)
+                           text_box_style=text_style, border_width=_border(settings, new_field, req.frame))
     tsa = timestamps.HTTPTimeStamper(settings.tsa_url, timeout=30)
     pdf_signer = signers.PdfSigner(meta, signer=signer, timestamper=tsa,
                                    stamp_style=style, new_field_spec=new_field)

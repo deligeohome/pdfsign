@@ -17,7 +17,8 @@ from PyQt5.QtWidgets import (
     QPushButton, QRadioButton, QScrollArea, QSpinBox, QSplitter, QVBoxLayout, QWidget,
 )
 
-from .config import FAILURE_MARKER, load_settings
+from .autolocate import LocateOptions, find_locations, select
+from .config import FAILURE_MARKER, ConfigError, load_settings, read_identities
 from .signing import SignRequest, list_signature_fields
 from .token import PinState, Token, WrongPinError
 from .workflow import Cancelled, sign_with_token
@@ -36,6 +37,7 @@ class PageView(QLabel):
         self.setCursor(Qt.CrossCursor)
         self.zoom = 1.5
         self.fields: list[tuple[str, QRectF, bool]] = []   # (name, display rect pt, signed)
+        self.auto: list[tuple[QRectF, str]] = []            # proposed auto-locations (rect, label)
         self.box: QRectF | None = None
         self.selected_field: str | None = None
         self._drag_start: QPointF | None = None
@@ -88,6 +90,12 @@ class PageView(QLabel):
             qp.drawRect(scale(r))
             qp.drawText(scale(r).adjusted(3, 2, 0, 0), Qt.AlignLeft | Qt.AlignTop,
                         f"{name}{' (signed)' if signed else ''}")
+        for r, label in self.auto:
+            col = QColor(255, 140, 0)
+            qp.setPen(QPen(col, 3, Qt.DashDotLine))
+            qp.fillRect(scale(r), QColor(255, 140, 0, 50))
+            qp.drawRect(scale(r))
+            qp.drawText(scale(r).adjusted(3, 0, 0, 0), Qt.AlignLeft | Qt.AlignBottom, label)
         rect = None
         if self._drag_start is not None:
             rect = QRectF(self._drag_start, self._drag_now).normalized()
@@ -129,14 +137,16 @@ class SignWorker(QThread):
     log = pyqtSignal(str)
     done = pyqtSignal(bool, str)
 
-    def __init__(self, req, settings, bridge):
+    def __init__(self, req, settings, bridge, placements=None):
         super().__init__()
         self.req, self.settings, self.bridge = req, settings, bridge
+        self.placements = placements
         bridge.word = settings.secret_word
 
     def run(self):
         try:
-            out = sign_with_token(self.req, self.settings, self.bridge.get_pin, log=self.log.emit)
+            out = sign_with_token(self.req, self.settings, self.bridge.get_pin, log=self.log.emit,
+                                  placements=self.placements)
             self.done.emit(True, out)
         except Cancelled as e:
             self.done.emit(False, str(e))
@@ -234,18 +244,23 @@ class MainWindow(QMainWindow):
 
         g = QGroupBox("Signature placement")
         gl = QVBoxLayout(g)
+        self.mode_auto = QRadioButton("Auto-locate from my identities")
+        self.auto_label = QLabel("")
+        self.auto_label.setWordWrap(True)
+        self.auto_label.setMinimumHeight(self.auto_label.fontMetrics().height() * 2 + 4)
         self.mode_draw = QRadioButton("Draw a box on the page (drag with the mouse)")
         self.mode_field = QRadioButton("Existing empty field:")
         self.mode_invis = QRadioButton("Invisible signature")
         self.mode_draw.setChecked(True)
         self.modes = QButtonGroup(self)
-        for m in (self.mode_draw, self.mode_field, self.mode_invis):
+        for m in (self.mode_auto, self.mode_draw, self.mode_field, self.mode_invis):
             self.modes.addButton(m)
         self.field_combo = QComboBox()
         self.field_combo.currentTextChanged.connect(self.on_field_combo)
         self.box_label = QLabel("No box drawn yet.")
         self.box_label.setWordWrap(True)
-        for w in (self.mode_draw, self.box_label, self.mode_field, self.field_combo, self.mode_invis):
+        for w in (self.mode_auto, self.auto_label, self.mode_draw, self.box_label, self.mode_field,
+                  self.field_combo, self.mode_invis):
             gl.addWidget(w)
         sv.addWidget(g)
 
@@ -329,7 +344,34 @@ class MainWindow(QMainWindow):
         if self.sig_fields:
             self.say(f"Signature fields: " + ", ".join(
                 f"{n} ({'signed' if f else 'empty'})" for n, f in self.sig_fields.items()))
-        self.goto(0)
+        self.auto_locate()
+
+    def auto_locate(self):
+        self.locations = []
+        try:
+            ids = read_identities()
+            if not ids.empty:
+                self.locations = find_locations(self.path, ids, LocateOptions.from_settings(self.settings))
+        except ConfigError as e:
+            self.say(f"Identities not read: {e}")
+            ids = None
+        unsigned = [l for l in self.locations if l.unsigned]
+        if ids is None or ids.empty:
+            self.auto_label.setText("No [identities] in credentials.ini.")
+        elif not self.locations:
+            self.auto_label.setText("Your identities were not found in this document.")
+        else:
+            done = sum(l.status == "signed" for l in self.locations)
+            self.auto_label.setText(f"{len(unsigned)} to sign (orange), {done} signed")
+            self.say("Identity locations:\n" + "\n".join(
+                f"  {'->' if l.unsigned else '  '} #{l.order} {l.describe()}" for l in self.locations))
+        self.mode_auto.setEnabled(bool(unsigned))
+        if unsigned:
+            self.mode_auto.setChecked(True)
+            self.goto(unsigned[0].page)
+        else:
+            self.mode_draw.setChecked(True)
+            self.goto(0)
 
     def goto(self, n: int):
         if not self.doc or not 0 <= n < self.doc.page_count:
@@ -352,6 +394,11 @@ class MainWindow(QMainWindow):
             r = w.rect * page.rotation_matrix
             fields.append((w.field_name, QRectF(r.x0, r.y0, r.width, r.height),
                            self.sig_fields.get(w.field_name, False)))
+        self.view.auto = []
+        for l in getattr(self, "locations", []):
+            if l.page == self.page_no and l.unsigned:
+                r = l.box * page.rotation_matrix
+                self.view.auto.append((QRectF(r.x0, r.y0, r.width, r.height), f"auto #{l.order}"))
         self.view.box = self.view.box if self.box_page == self.page_no else None
         self.view.set_page(QPixmap.fromImage(img), zoom, fields)
 
@@ -388,8 +435,30 @@ class MainWindow(QMainWindow):
         if not self.doc:
             QMessageBox.information(self, "pdfsign", "Open a PDF first.")
             return
-        field, page, box = None, 0, None
-        if self.mode_draw.isChecked():
+        field, page, box, placements = None, 0, None, None
+        if self.mode_auto.isChecked():
+            unsigned = [l for l in self.locations if l.unsigned]
+            if not unsigned:
+                QMessageBox.information(self, "pdfsign", "No unsigned identity location.")
+                return
+            mode = "first"
+            if len(unsigned) > 1:
+                mb = QMessageBox(QMessageBox.Question, "Several signature places",
+                                 f"Your identity appears at {len(unsigned)} unsigned places:\n\n" +
+                                 "\n".join(f"#{l.order}  {l.describe()}" for l in unsigned) +
+                                 "\n\nSign only the first one, or all of them?", parent=self)
+                b_first = mb.addButton(f"First (#{unsigned[0].order}, page {unsigned[0].page + 1})",
+                                       QMessageBox.AcceptRole)
+                b_all = mb.addButton(f"All {len(unsigned)}", QMessageBox.AcceptRole)
+                mb.addButton(QMessageBox.Cancel)
+                mb.exec_()
+                if mb.clickedButton() not in (b_first, b_all):
+                    return
+                mode = "all" if mb.clickedButton() is b_all else "first"
+            chosen = select(self.locations, mode)
+            placements = [l.placement() for l in chosen]
+            self.say("Auto placement: " + ", ".join(f"#{l.order} (page {l.page + 1})" for l in chosen))
+        elif self.mode_draw.isChecked():
             if self.view.box is None or self.box_page is None:
                 QMessageBox.information(self, "pdfsign", "Drag a rectangle on the page where the "
                                         "signature should go (or choose another placement).")
@@ -411,7 +480,7 @@ class MainWindow(QMainWindow):
                           reason=self.reason.text().strip(), location=self.location.text().strip(),
                           contact=self.contact.text().strip(), level=self.level.currentText())
         self.sign_btn.setEnabled(False)
-        self.worker = SignWorker(req, self.settings, self.bridge)
+        self.worker = SignWorker(req, self.settings, self.bridge, placements)
         self.worker.log.connect(self.say)
         self.worker.done.connect(self.on_done)
         self.worker.start()
@@ -421,8 +490,15 @@ class MainWindow(QMainWindow):
         self.refresh_token()
         if ok:
             self.say(f"✔ Done: {msg}")
-            if QMessageBox.question(self, "Signed", f"Signed PDF saved:\n{msg}\n\nOpen it?") == QMessageBox.Yes:
+            mb = QMessageBox(QMessageBox.Information, "Signed", f"Signed PDF saved:\n{msg}", parent=self)
+            b_view = mb.addButton("Open in PDF viewer", QMessageBox.AcceptRole)
+            b_load = mb.addButton("Load here (next step)", QMessageBox.AcceptRole)
+            mb.addButton(QMessageBox.Close)
+            mb.exec_()
+            if mb.clickedButton() is b_view:
                 subprocess.Popen(["xdg-open", msg])
+            elif mb.clickedButton() is b_load:
+                self.open_pdf(msg)
         else:
             self.say(f"✘ {msg}")
             QMessageBox.warning(self, "Not signed", msg)

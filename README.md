@@ -12,7 +12,10 @@ Greek **APED/ERMIS qualified signature certificate**. It should work with any to
 
 * **GUI** (PyQt5): open a PDF, drag a box where the signature goes, or click an existing empty
   signature field, or choose an invisible signature.
-* **CLI** for batch use: `pdfsign sign doc.pdf --page 4 --box 225,600,368,655`.
+* **Auto-location**: put your name and role in `[identities]`, and pdfsign finds where *you* sign.
+  It uses the empty signature field next to your name, or proposes a new box on the signature line.
+  It handles multi-step forms and documents with several signature places.
+* **CLI** for batch use: `pdfsign sign doc.pdf` (auto-located) or `--page 4 --box 225,600,368,655`.
 * **PAdES B-T / B-LT / B-LTA**: SHA-256, RSA computed on the token, RFC 3161 timestamp, with the
   certificate chain and OCSP/CRL embedded for long-term validation. The issuer chain is fetched
   automatically via AIA.
@@ -98,6 +101,9 @@ cd pdfsign
 | `[signature] level` | `B-LT` | `B-T`, `B-LT` or `B-LTA` |
 | `[signature] stamp_text` | … | `%(signer)s` and `%(ts)s` placeholders |
 | `[signature] font` | `auto` | TTF/OTF with **1000 units/em** (e.g. Noto Sans) |
+| `[signature] stamp_border` | `auto` | frame around the stamp: only for new boxes (`auto`), `yes`, `no` |
+| `[autolocate] field_radius` | `120` | max distance (pt) between your name and its signature field |
+| `[autolocate] box_width/height` | `160` / `50` | size of a proposed new box |
 
 `credentials.ini` (git-ignored; must be `chmod 600`; or point `$PDFSIGN_CREDENTIALS` elsewhere):
 ```ini
@@ -109,14 +115,55 @@ Fill in `signature_password` for `secret_type = password`, or `signature_pin` (d
 `secret_type = pin`. Leave both empty to be asked every time. Storing the secret is a
 convenience/security trade-off: anyone who can read the file and has the token can sign.
 
+## Auto-location of the signature place
+
+Add the text that identifies you to `credentials.ini`:
+```ini
+[identities]
+names = Jane Doe
+    DOE JANE
+roles = Project Coordinator
+```
+pdfsign searches the PDF for these entries. Matching ignores case, accents and punctuation (Greek
+included), and multi-word entries must be adjacent words. For each place where you are found:
+
+| what is next to your name (within `field_radius`) | action |
+|---|---|
+| an **empty signature field** | sign into that field |
+| a **signed** field | already done, skipped |
+| an **empty box drawn** in the page (form frame without a field) | sign exactly into that box, without an extra frame |
+| nothing | propose a **new box** above / right / below / left of the name, fitted between the surrounding text and table lines |
+
+A field or box only belongs to your text if it is **beside** it or **above/below** it, never diagonal.
+A diagonal box is typically the slot of the next label, e.g. the director's box under the requester's.
+
+* `names` are primary, **per page**. On a page showing your name, a role only counts when it sits
+  right next to that name, so a role shared with other signers (e.g. "Member") is not mistaken for yours.
+  On a page without your name, the role itself marks the place, e.g. a form that only says
+  "THE REQUESTING PERSON IN CHARGE:" next to the signature field.
+* A bare mention of your name (e.g. in a member list) is ignored when the document has a better
+  candidate: a nearby signature field, or a signature line / "Signature" label next to the name.
+* If several unsigned places remain, you are asked whether to sign the **first** one or **all** of them
+  (GUI dialog, CLI prompt, or `--first` / `--all`). "All" uses one login and adds one signature per place.
+* **Multi-step forms**: each run signs the next unsigned step. Already-signed steps are recognised
+  by their signed field, including boxes pdfsign created itself.
+
+Check the result without the token: `./pdfsign locate doc.pdf`. In the GUI the proposals are shown
+in orange, and *Auto-locate* is preselected on the page of the first unsigned place. Tune with
+`[autolocate] field_radius, box_width, box_height` in `config.ini`.
+
 ## Use
 
 **GUI:** `./pdfsign` or `./pdfsign gui file.pdf`. Existing signature fields are outlined (blue = empty,
-green = signed). Click one, or drag a new box, then click *Sign PDF…*.
+green = signed) and auto-located places are orange. Keep *Auto-locate*, click a field, or drag a new
+box, then click *Sign PDF…*. After signing, *Load here (next step)* opens the result for the next step.
 
 **CLI:**
 ```bash
 ./pdfsign fields doc.pdf                                  # list signature fields
+./pdfsign locate doc.pdf                                  # where [identities] would sign (no token)
+./pdfsign sign doc.pdf                                    # auto-locate; asks first/all if several
+./pdfsign sign doc.pdf --all                              # sign every unsigned identity place
 ./pdfsign sign doc.pdf --field Signature1                 # fill an existing empty field
 ./pdfsign sign doc.pdf --page 1 --box 350,50,560,120 --reason "Approved" --location "Heraklion"
 ./pdfsign sign doc.pdf --invisible --ask                  # ignore stored secret, prompt
@@ -148,6 +195,7 @@ green = signed). Click one, or drag a new box, then click *Sign PDF…*.
 | `opensc-pdfsign.conf` | OpenSC override (PIN pad off), used only by pdfsign |
 | `pdfsign_app/token.py` | PKCS#11 access and lockout protection |
 | `pdfsign_app/signing.py` | PAdES signing, TSA, LTV, verification (pyHanko) |
+| `pdfsign_app/autolocate.py` | signature place detection from `[identities]` |
 | `pdfsign_app/workflow.py`, `cli.py`, `gui.py` | sign flow and user interfaces |
 
 ## License

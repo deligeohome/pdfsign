@@ -69,6 +69,10 @@ class Settings:
     timestamp_format: str
     font: str
     font_size: int
+    stamp_border: str = "auto"    # auto | yes | no
+    field_radius: float = 120.0
+    box_width: float = 160.0
+    box_height: float = 50.0
 
     @property
     def secret_word(self) -> str:
@@ -107,7 +111,47 @@ def load_settings(path: Path = CONFIG_FILE) -> Settings:
         timestamp_format=g("signature", "timestamp_format", "%Y-%m-%d %H:%M:%S %Z"),
         font=font,
         font_size=int(g("signature", "font_size", "9") or 9),
+        stamp_border=(g("signature", "stamp_border", "auto") or "auto").lower(),
+        field_radius=float(g("autolocate", "field_radius", "120") or 120),
+        box_width=float(g("autolocate", "box_width", "160") or 160),
+        box_height=float(g("autolocate", "box_height", "50") or 50),
     )
+
+
+@dataclass
+class Identities:
+    """Text that marks where the user signs. names are primary, roles are the fallback."""
+    names: list
+    roles: list
+
+    @property
+    def empty(self) -> bool:
+        return not (self.names or self.roles)
+
+
+def _check_private(path: Path) -> None:
+    st = path.stat()
+    if st.st_uid != os.getuid():
+        raise ConfigError(f"{path} is not owned by you - refusing to use it.")
+    if st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise ConfigError(f"{path} is accessible by group/others. Run:  chmod 600 {path}")
+
+
+def read_identities(path: Path = CREDENTIALS_FILE) -> Identities:
+    """[identities] section: 'names' (primary) and 'roles' or any other key (fallback).
+    One entry per line (indent continuation lines)."""
+    if not path.exists():
+        return Identities([], [])
+    _check_private(path)
+    cp = configparser.ConfigParser(interpolation=None)
+    cp.read(path, encoding="utf-8")
+    if not cp.has_section("identities"):
+        return Identities([], [])
+    lines = lambda v: [x.strip() for x in v.splitlines() if x.strip() and not x.strip().startswith("#")]  # noqa: E731
+    names, roles = [], []
+    for key, value in cp.items("identities"):
+        (names if key == "names" else roles).extend(lines(value))
+    return Identities(names, roles)
 
 
 def validate_secret(secret: str, secret_type: str = "password",
@@ -149,11 +193,7 @@ def read_stored_secret(secret_type: str, path: Path = CREDENTIALS_FILE) -> str |
             f"({FAILURE_MARKER.read_text().strip()}).\n"
             f"The stored secret is disabled to protect the token from locking.\n"
             f"Fix {path}, then delete {FAILURE_MARKER} to re-enable it.")
-    st = path.stat()
-    if st.st_uid != os.getuid():
-        raise ConfigError(f"{path} is not owned by you - refusing to use it.")
-    if st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
-        raise ConfigError(f"{path} is accessible by group/others. Run:  chmod 600 {path}")
+    _check_private(path)
     cp = configparser.ConfigParser(interpolation=None)
     cp.read(path, encoding="utf-8")
     keys = (["signature_password", "signature_pin"] if secret_type == "password"
