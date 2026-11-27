@@ -86,7 +86,7 @@ cat > "$HOME/.local/share/applications/pdfsign.desktop" <<EOF
 Type=Application
 Name=PDF Sign
 Comment=Sign PDF documents with a smart card / USB token
-Exec="$HERE/pdfsign" gui %f
+Exec="$HERE/pdfsign" gui %F
 Icon=application-pdf
 MimeType=application/pdf;
 Terminal=false

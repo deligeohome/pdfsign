@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import os
 import tempfile
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
 from .config import ConfigError, Settings, read_stored_secret
 from .signing import Placement, SignRequest, TokenSigner, fetch_chain, sign_pdf
-from .token import PinSafetyError, PinState, Token
+from .token import PinSafetyError, PinState, Token, TokenError
 
 
 class Cancelled(Exception):
@@ -21,6 +21,20 @@ class Cancelled(Exception):
 PinProvider = Callable[[PinState, "str | None"], "str | None"]
 
 
+@dataclass
+class Job:
+    """One file to sign: the request plus where (placements) - None = req's own field/box."""
+    req: SignRequest
+    placements: list[Placement] | None = None
+
+
+@dataclass
+class JobResult:
+    job: Job
+    output: str | None = None
+    error: str | None = None
+
+
 def sign_with_token(req: SignRequest, settings: Settings, get_pin: PinProvider,
                     log: Callable[[str], None] = print,
                     allow_final_try: bool = False, use_stored_pin: bool = True,
@@ -28,6 +42,16 @@ def sign_with_token(req: SignRequest, settings: Settings, get_pin: PinProvider,
     """Sign req.input_pdf -> req.output_pdf. With `placements`, one signature per placement
     is applied in order (one login, chained incremental updates); otherwise req's own
     field/page/box is used."""
+    res = sign_batch([Job(req, placements)], settings, get_pin, log, allow_final_try,
+                     use_stored_pin, stop_on_error=True)[0]
+    return res.output
+
+
+def sign_batch(jobs: list[Job], settings: Settings, get_pin: PinProvider,
+               log: Callable[[str], None] = print, allow_final_try: bool = False,
+               use_stored_pin: bool = True, stop_on_error: bool = False) -> list[JobResult]:
+    """Sign several files with ONE token login. A failure in one file (e.g. TSA down) is
+    recorded and the next file is tried, unless stop_on_error. Login failures always stop."""
     with Token.from_settings(settings) as tok:
         log(f"Token: {tok.signer_name}  [{tok.slot_label}]")
         chain = fetch_chain(tok.certificate, log)
@@ -57,9 +81,22 @@ def sign_with_token(req: SignRequest, settings: Settings, get_pin: PinProvider,
         del pin
         log("Token unlocked.")
         signer = TokenSigner(tok, chain)
-        if not placements:
-            return sign_pdf(req, signer, settings, chain, log=log)
-        return _sign_chain(req, placements, signer, settings, chain, log)
+        results = []
+        for n, job in enumerate(jobs, 1):
+            if len(jobs) > 1:
+                log(f"=== file {n}/{len(jobs)}: {Path(job.req.input_pdf).name}")
+            try:
+                if job.placements:
+                    out = _sign_chain(job.req, job.placements, signer, settings, chain, log)
+                else:
+                    out = sign_pdf(job.req, signer, settings, chain, log=log)
+                results.append(JobResult(job, output=out))
+            except Exception as e:                       # noqa: BLE001 - reported per file
+                if stop_on_error or isinstance(e, TokenError):   # token problems stop the batch
+                    raise
+                log(f"FAILED {Path(job.req.input_pdf).name}: {e}")
+                results.append(JobResult(job, error=str(e)))
+        return results
 
 
 def _sign_chain(req: SignRequest, placements: list[Placement], signer, settings, chain, log) -> str:

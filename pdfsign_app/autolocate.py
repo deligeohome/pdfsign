@@ -20,7 +20,8 @@ as "mention". Tier-2 locations are never dropped, so the remaining steps of a fi
 multi-step form stay available after the first step has been signed.
 Matching ignores case, accents and punctuation; multi-word entries must be adjacent words.
 Names match in any word order ("Maria Papadopoulou" = "PAPADOPOULOU MARIA", the usual order
-in Greek administrative forms); roles must keep their word order.
+in Greek administrative forms) and with all but one word abbreviated to its initial
+("M. Papadopoulou", "Papadopoulou M."); roles must keep their word order.
 """
 
 from __future__ import annotations
@@ -85,6 +86,7 @@ class Location:
     box_pdf: tuple | None = None       # new box in PDF user space (x1, y1, x2, y2)
     order: int = 0
     cue: bool = False                  # signature line / label next to a "new" location
+    space: bool = False                # cue is free signing space above a stand-alone name
     drawn: bool = False                # "new" box is an empty rectangle drawn in the page
     anchor: str | None = None          # PDF edge of a proposed box that faces the text
 
@@ -102,7 +104,8 @@ class Location:
         what = {"field": f"empty field '{self.field_name}'",
                 "signed": f"already signed ('{self.field_name}')",
                 "new": ("empty box drawn next to the text" if self.drawn else
-                        "new box next to the text" + (" (signature line found)" if self.cue else "")),
+                        "new box next to the text" + (" (signature space above the name)" if self.space
+                                                      else " (signature line found)" if self.cue else "")),
                 "mention": "text mention only, not used"}[self.status]
         return f"page {self.page + 1}: \"{' / '.join(self.terms)}\" -> {what}"
 
@@ -192,22 +195,49 @@ def _adjacent(a: pymupdf.Rect, b: pymupdf.Rect) -> bool:
     return same_line or next_line
 
 
+def _variants(toks: list[str], abbrev: bool) -> list[list[str]]:
+    """The name itself plus, for names, forms with every word but one cut to its initial."""
+    out = [toks]
+    if abbrev and len(toks) >= 2:
+        for keep in range(len(toks)):
+            if len(toks[keep]) > 1:
+                out.append([t if i == keep else t[0] for i, t in enumerate(toks)])
+    return out
+
+
 def _find(words: list[_Word], term: str, any_order: bool = False) -> list[pymupdf.Rect]:
-    toks = _tokens(term)
-    if not toks:
+    """any_order (used for names): any word order, and initials allowed (see _variants)."""
+    base = _tokens(term)
+    if not base:
         return []
-    orders = (set(itertools.permutations(toks)) if any_order and len(toks) <= 4 else {tuple(toks)})
+    orders = set()
+    for toks in _variants(base, abbrev=any_order):
+        orders |= set(itertools.permutations(toks)) if any_order and len(toks) <= 4 else {tuple(toks)}
+    n = len(base)
     hits = []
-    for i in range(len(words) - len(toks) + 1):
+    for i in range(len(words) - n + 1):
         if not any(all(words[i + j].norm == t for j, t in enumerate(o)) for o in orders):
             continue
-        if all(_adjacent(words[i + j - 1].rect, words[i + j].rect) for j in range(1, len(toks))):
+        if all(_adjacent(words[i + j - 1].rect, words[i + j].rect) for j in range(1, n)):
             r = pymupdf.Rect(words[i].rect)
-            for j in range(1, len(toks)):
+            for j in range(1, n):
                 r |= words[i + j].rect
             if r not in hits:
                 hits.append(r)
     return hits
+
+
+def _signature_space(words: list[_Word], rect: pymupdf.Rect, min_space: float = 28) -> bool:
+    """Typical signature block: the name stands alone on its line (no label such as
+    "NAME:" right next to it) and there is free space above it to sign in."""
+    real = [w for w in words if w.norm and not rect.contains(w.rect)]
+    for w in real:
+        v = min(w.rect.y1, rect.y1) - max(w.rect.y0, rect.y0)
+        if v > 0.5 * rect.height and _gap(w.rect, rect) < 20:
+            return False                       # label / other text glued to the name
+    above = [w.rect.y1 for w in real if w.rect.y1 <= rect.y0 + 1
+             and w.rect.x1 > rect.x0 - 10 and w.rect.x0 < rect.x1 + 10]
+    return bool(above) and rect.y0 - max(above) >= min_space
 
 
 def _place_box(page, anchor: pymupdf.Rect, words: list[_Word], taken: list[pymupdf.Rect],
@@ -216,8 +246,13 @@ def _place_box(page, anchor: pymupdf.Rect, words: list[_Word], taken: list[pymup
     margin = 8
     cx, cy = (anchor.x0 + anchor.x1) / 2, (anchor.y0 + anchor.y1) / 2
 
+    # keep the box inside the page's text margins (not out at the paper edge)
+    xs = [wd.rect for wd in words if wd.norm]
+    lo = max(area.x0 + margin, min((r.x0 for r in xs), default=area.x0) - 2)
+    hi = min(area.x1 - margin, max((r.x1 for r in xs), default=area.x1) + 2)
+
     def clamp_x(x0):
-        return min(max(x0, area.x0 + margin), area.x1 - margin - w)
+        return max(min(x0, hi - w), lo) if hi - lo >= w else min(max(x0, area.x0 + margin), area.x1 - margin - w)
 
     cands = [  # preference order: above the name (typical), right, below, left
         pymupdf.Rect(clamp_x(cx - w / 2), anchor.y0 - 4 - h, clamp_x(cx - w / 2) + w, anchor.y0 - 4),
@@ -326,6 +361,8 @@ def find_locations(pdf_path: str, identities: Identities,
                         box, loc.anchor = _place_box(page, rect, words, taken, opts.box_width,
                                                      opts.box_height, hlines)
                         loc.cue = _has_cue(page, words, rect)
+                        if not loc.cue and terms and prim:
+                            loc.cue = loc.space = _signature_space(words, rect)
                     taken.append(box)
                     loc.box = box
                     loc.box_pdf = tuple((box * ~page.transformation_matrix).normalize())

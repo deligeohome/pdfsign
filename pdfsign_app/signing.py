@@ -80,14 +80,15 @@ def output_suffix(settings: Settings, cert: asn1_x509.Certificate | None) -> str
     return s or "_signed"
 
 
-def default_output(input_pdf: str, suffix: str) -> str:
+def default_output(input_pdf: str, suffix: str, out_dir: str | None = None) -> str:
     """<stem><suffix>.pdf next to the input; never the input itself, never an existing file.
     A file that already ends with the suffix (next step of a form) is not suffixed twice."""
     src = Path(input_pdf)
+    folder = Path(out_dir).expanduser() if out_dir else src.parent
     stem = src.stem if src.stem.endswith(suffix) else src.stem + suffix
-    cand, n = src.with_name(stem + ".pdf"), 2
+    cand, n = folder / f"{stem}.pdf", 2
     while cand.exists() or cand.resolve() == src.resolve():
-        cand, n = src.with_name(f"{stem}-{n}.pdf"), n + 1
+        cand, n = folder / f"{stem}-{n}.pdf", n + 1
     return str(cand)
 
 

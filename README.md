@@ -15,7 +15,9 @@ Greek **APED/ERMIS qualified signature certificate**. It should work with any to
 * **Auto-location**: put your name and role in `[identities]`, and pdfsign finds where *you* sign.
   It uses the empty signature field next to your name, or proposes a new box on the signature line.
   It handles multi-step forms and documents with several signature places.
-* **CLI** for batch use: `pdfsign sign doc.pdf` (auto-located) or `--page 4 --box 225,600,368,655`.
+* **Batch signing** of many files with one password entry: select several files in the GUI's
+  *Open* dialog and click *Sign all files*, or `pdfsign sign 'reports/*.pdf'` on the command line.
+* **CLI** for scripting: `pdfsign sign doc.pdf` (auto-located) or `--page 4 --box 225,600,368,655`.
 * **PAdES B-T / B-LT / B-LTA**: SHA-256, RSA computed on the token, RFC 3161 timestamp, with the
   certificate chain and OCSP/CRL embedded for long-term validation. The issuer chain is fetched
   automatically via AIA.
@@ -127,7 +129,8 @@ names = Jane Doe
 roles = Project Coordinator
 ```
 pdfsign searches the PDF for these entries. Matching ignores case, accents and punctuation (Greek
-included), and multi-word entries must be adjacent words. For each place where you are found:
+included), and multi-word entries must be adjacent words. Names also match in any word order and
+with initials (`Jane Doe` finds `DOE JANE`, `J. Doe` and `Doe J.`). For each place where you are found:
 
 | what is next to your name (within `field_radius`) | action |
 |---|---|
@@ -143,8 +146,9 @@ A diagonal box is typically the slot of the next label, e.g. the director's box 
   right next to that name, so a role shared with other signers (e.g. "Member") is not mistaken for yours.
   On a page without your name, the role itself marks the place, e.g. a form that only says
   "THE REQUESTING PERSON IN CHARGE:" next to the signature field.
-* A bare mention of your name (e.g. in a member list) is ignored when the document has a better
-  candidate: a nearby signature field, or a signature line / "Signature" label next to the name.
+* A bare mention of your name (e.g. in a member list or a "NAME: …" line) is ignored when the
+  document has a better candidate: a nearby signature field, a signature line / "Signature" label,
+  or a name standing alone with free signing space above it (a typical signature block).
 * If several unsigned places remain, you are asked whether to sign the **first** one or **all** of them
   (GUI dialog, CLI prompt, or `--first` / `--all`). "All" uses one login and adds one signature per place.
 * **Multi-step forms**: each run signs the next unsigned step. Already-signed steps are recognised
@@ -156,9 +160,13 @@ in orange, and *Auto-locate* is preselected on the page of the first unsigned pl
 
 ## Use
 
-**GUI:** `./pdfsign` or `./pdfsign gui file.pdf`. Existing signature fields are outlined (blue = empty,
+**GUI:** `./pdfsign` or `./pdfsign gui file.pdf …`. Existing signature fields are outlined (blue = empty,
 green = signed) and auto-located places are orange. Keep *Auto-locate*, click a field, or drag a new
 box, then click *Sign PDF…*. After signing, *Load here (next step)* opens the result for the next step.
+
+Select **several files** in *Open…* (Ctrl/Shift-click) and a file list appears showing what is left
+to sign in each one. Click a file to inspect it, or *Sign all files (auto-locate)…* to sign them all
+with one password entry. Signed copies are saved next to the originals as `<name>_<initials>.pdf`.
 
 **CLI:**
 ```bash
@@ -171,7 +179,16 @@ box, then click *Sign PDF…*. After signing, *Load here (next step)* opens the 
 ./pdfsign sign doc.pdf --invisible --ask                  # ignore stored secret, prompt
 ./pdfsign sign doc.pdf --invisible --secret-type pin      # unlock with a numeric PIN this time
 ./pdfsign verify doc_MP.pdf
+
+# batch: files, folders and patterns; one password entry for all
+./pdfsign sign 'reports/*Mission*.pdf'                    # every matching file
+./pdfsign sign reports/ --pattern '*2026*.pdf' --all -y   # folder + filter, no questions
+./pdfsign sign a.pdf b.pdf --outdir signed/               # write the signed copies elsewhere
 ```
+In batch mode each file is auto-located, files with nothing left to sign are skipped, and outputs
+of earlier runs (`*_<initials>.pdf`) found through a folder or pattern are ignored. You are asked
+once whether to sign the first or all places (unless `--first`/`--all`) and to confirm (unless `-y`).
+A failure in one file (e.g. timestamp server down) does not stop the others; a summary is printed.
 `--box` is `x1,y1,x2,y2` in PDF points, origin bottom-left (A4 = 595 × 842). The output defaults to
 `<name>_<initials>.pdf`, with the initials taken from your certificate (e.g. `report_MP.pdf`). A file
 that already carries the suffix is not suffixed twice, and existing files get `-2`, `-3`, …

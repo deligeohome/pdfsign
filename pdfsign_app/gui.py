@@ -13,7 +13,8 @@ from PyQt5.QtCore import QObject, QPointF, QRectF, Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAction, QApplication, QButtonGroup, QComboBox, QFileDialog, QFormLayout, QGroupBox,
-    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
+    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+    QMessageBox, QPlainTextEdit,
     QPushButton, QRadioButton, QScrollArea, QSpinBox, QSplitter, QVBoxLayout, QWidget,
 )
 
@@ -21,7 +22,7 @@ from .autolocate import LocateOptions, find_locations, select
 from .config import FAILURE_MARKER, ConfigError, load_settings, read_identities
 from .signing import SignRequest, default_output, list_signature_fields, output_suffix
 from .token import PinState, Token, WrongPinError
-from .workflow import Cancelled, sign_with_token
+from .workflow import Cancelled, Job, sign_batch, sign_with_token
 
 MIN_BOX_PT = 20  # smallest accepted signature box (points)
 
@@ -157,6 +158,29 @@ class SignWorker(QThread):
             self.done.emit(False, f"{type(e).__name__}: {e}")
 
 
+class BatchWorker(QThread):
+    """Signs several files with one login (workflow.sign_batch)."""
+    log = pyqtSignal(str)
+    done = pyqtSignal(bool, object)            # ok, list[JobResult] or error text
+
+    def __init__(self, jobs, settings, bridge):
+        super().__init__()
+        self.jobs, self.settings, self.bridge = jobs, settings, bridge
+        bridge.word = settings.secret_word
+
+    def run(self):
+        try:
+            self.done.emit(True, sign_batch(self.jobs, self.settings, self.bridge.get_pin,
+                                            log=self.log.emit))
+        except Cancelled as e:
+            self.done.emit(False, str(e))
+        except WrongPinError as e:
+            self.done.emit(False, f"{e}\n\nThe stored secret has been disabled ({FAILURE_MARKER}).")
+        except Exception as e:  # noqa: BLE001
+            self.log.emit(traceback.format_exc())
+            self.done.emit(False, f"{type(e).__name__}: {e}")
+
+
 def ask_pin_dialog(parent, state: PinState, note, word: str = "password") -> str | None:
     msg = ""
     if note:
@@ -177,9 +201,10 @@ def ask_pin_dialog(parent, state: PinState, note, word: str = "password") -> str
 
 # ---------------------------------------------------------------------- main window
 class MainWindow(QMainWindow):
-    def __init__(self, pdf: str | None):
+    def __init__(self, pdfs: list[str] | None = None):
         super().__init__()
         self.settings = load_settings()
+        self.files: list[str] = []
         self.doc = None
         self.path: str | None = None
         self.page_no = 0
@@ -190,8 +215,8 @@ class MainWindow(QMainWindow):
         self.resize(1300, 950)
         self._build_ui()
         self.refresh_token()
-        if pdf:
-            self.open_pdf(pdf)
+        if pdfs:
+            self.set_files(pdfs)
 
     # ---- UI
     def _build_ui(self):
@@ -240,6 +265,22 @@ class MainWindow(QMainWindow):
         gl.addWidget(self.token_label)
         gl.addLayout(row)
         gl.addWidget(b)
+        sv.addWidget(g)
+
+        self.files_box = g = QGroupBox("Files")
+        gl = QVBoxLayout(g)
+        self.file_list = QListWidget()
+        rows = self.file_list.fontMetrics().height() + 6
+        self.file_list.setMinimumHeight(rows * 4)
+        self.file_list.setMaximumHeight(rows * 7)
+        self.file_list.setTextElideMode(Qt.ElideMiddle)
+        self.file_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.file_list.currentRowChanged.connect(self.on_file_row)
+        self.batch_btn = QPushButton("Sign all files (auto-locate)…")
+        self.batch_btn.clicked.connect(self.sign_all)
+        gl.addWidget(self.file_list)
+        gl.addWidget(self.batch_btn)
+        g.setVisible(False)
         sv.addWidget(g)
 
         g = QGroupBox("Signature placement")
@@ -318,9 +359,49 @@ class MainWindow(QMainWindow):
 
     # ---- document
     def choose_pdf(self):
-        p, _ = QFileDialog.getOpenFileName(self, "Open PDF", self.path or str(Path.home()), "PDF (*.pdf)")
-        if p:
-            self.open_pdf(p)
+        start = str(Path(self.path).parent) if self.path else str(Path.home())
+        ps, _ = QFileDialog.getOpenFileNames(self, "Open PDF(s)", start, "PDF (*.pdf)")
+        if ps:
+            self.set_files(ps)
+
+    def set_files(self, paths: list[str]):
+        """One file: plain viewer. Several: file list + 'Sign all files'."""
+        self.files = [str(Path(p).resolve()) for p in paths]
+        self.files_box.setVisible(len(self.files) > 1)
+        self.file_list.blockSignals(True)
+        self.file_list.clear()
+        if len(self.files) > 1:
+            self.files_box.setTitle(f"Files ({len(self.files)})")
+            ids = self._identities()
+            for p in self.files:
+                it = QListWidgetItem(f"[{self._status(p, ids)}]  {Path(p).name}")
+                it.setToolTip(p)
+                self.file_list.addItem(it)
+        self.file_list.blockSignals(False)
+        self.file_list.setCurrentRow(0)
+        self.open_pdf(self.files[0])
+
+    def _identities(self):
+        try:
+            ids = read_identities()
+            return None if ids.empty else ids
+        except ConfigError:
+            return None
+
+    def _status(self, path: str, ids) -> str:
+        if ids is None:
+            return "no identities"
+        try:
+            locs = find_locations(path, ids, LocateOptions.from_settings(self.settings))
+        except Exception as e:  # noqa: BLE001
+            return f"error: {e}"
+        todo = sum(l.unsigned for l in locs)
+        done = sum(l.status == "signed" for l in locs)
+        return f"{todo} to sign" if todo else ("signed" if done else "not found")
+
+    def on_file_row(self, row: int):
+        if 0 <= row < len(self.files) and self.files[row] != self.path:
+            self.open_pdf(self.files[row])
 
     def open_pdf(self, path: str):
         try:
@@ -486,6 +567,80 @@ class MainWindow(QMainWindow):
         self.worker.done.connect(self.on_done)
         self.worker.start()
 
+    def sign_all(self):
+        """Auto-locate and sign every listed file; outputs next to each input; one login."""
+        ids = self._identities()
+        if ids is None:
+            QMessageBox.information(self, "pdfsign", "Batch signing needs [identities] in credentials.ini.")
+            return
+        opts = LocateOptions.from_settings(self.settings)
+        located = [(p, find_locations(p, ids, opts)) for p in self.files]
+        todo = [(p, locs) for p, locs in located if any(l.unsigned for l in locs)]
+        skipped = [Path(p).name for p, locs in located if not any(l.unsigned for l in locs)]
+        if not todo:
+            QMessageBox.information(self, "pdfsign", "Nothing to sign: your identities are already "
+                                    "signed or not found in these files.")
+            return
+        mode = "first"
+        multi = [p for p, locs in todo if sum(l.unsigned for l in locs) > 1]
+        if multi:
+            mb = QMessageBox(QMessageBox.Question, "Several signature places",
+                             f"{len(multi)} of the files have several unsigned places for you:\n\n" +
+                             "\n".join(Path(p).name for p in multi) +
+                             "\n\nIn those files, sign only the first place or all of them?", parent=self)
+            b_first = mb.addButton("First", QMessageBox.AcceptRole)
+            b_all = mb.addButton("All", QMessageBox.AcceptRole)
+            mb.addButton(QMessageBox.Cancel)
+            mb.exec_()
+            if mb.clickedButton() not in (b_first, b_all):
+                return
+            mode = "all" if mb.clickedButton() is b_all else "first"
+        suffix = output_suffix(self.settings, getattr(self, "cert", None))
+        self.settings.tsa_url = self.tsa.text().strip()
+        self.settings.secret_type = self.secret_type.currentData()
+        jobs, lines = [], []
+        for p, locs in todo:
+            chosen = select(locs, mode)
+            out = default_output(p, suffix)
+            jobs.append(Job(SignRequest(p, out, reason=self.reason.text().strip(),
+                                        location=self.location.text().strip(),
+                                        contact=self.contact.text().strip(),
+                                        level=self.level.currentText()),
+                            [l.placement() for l in chosen]))
+            lines.append(f"{Path(p).name}  ({len(chosen)}×)  →  {Path(out).name}")
+        text = f"Sign {len(jobs)} file(s)? Signed copies are saved next to the originals:\n\n" + "\n".join(lines)
+        if skipped:
+            text += "\n\nNothing to sign in: " + ", ".join(skipped)
+        if QMessageBox.question(self, "Sign all files", text) != QMessageBox.Yes:
+            return
+        self.sign_btn.setEnabled(False)
+        self.batch_btn.setEnabled(False)
+        self.worker = BatchWorker(jobs, self.settings, self.bridge)
+        self.worker.log.connect(self.say)
+        self.worker.done.connect(self.on_batch_done)
+        self.worker.start()
+
+    def on_batch_done(self, ok: bool, res):
+        self.sign_btn.setEnabled(True)
+        self.batch_btn.setEnabled(True)
+        self.refresh_token()
+        if not ok:
+            self.say(f"✘ {res}")
+            QMessageBox.warning(self, "Not signed", res)
+            return
+        good = [r for r in res if r.output]
+        bad = [r for r in res if r.error]
+        lines = [f"✔ {Path(r.output).name}" for r in good] + \
+                [f"✘ {Path(r.job.req.input_pdf).name}: {r.error}" for r in bad]
+        self.say("Batch finished:\n  " + "\n  ".join(lines))
+        mb = QMessageBox(QMessageBox.Information if not bad else QMessageBox.Warning, "Batch signed",
+                         f"{len(good)} signed, {len(bad)} failed.\n\n" + "\n".join(lines), parent=self)
+        b_load = mb.addButton("Load signed files", QMessageBox.AcceptRole) if good else None
+        mb.addButton(QMessageBox.Close)
+        mb.exec_()
+        if good and mb.clickedButton() is b_load:
+            self.set_files([r.output for r in good])
+
     def on_done(self, ok: bool, msg: str):
         self.sign_btn.setEnabled(True)
         self.refresh_token()
@@ -499,14 +654,25 @@ class MainWindow(QMainWindow):
             if mb.clickedButton() is b_view:
                 subprocess.Popen(["xdg-open", msg])
             elif mb.clickedButton() is b_load:
-                self.open_pdf(msg)
+                if len(self.files) > 1 and self.path in self.files:
+                    # replace the original by its signed copy in the file list
+                    row = self.files.index(self.path)
+                    self.files[row] = str(Path(msg).resolve())
+                    self.file_list.blockSignals(True)
+                    self.file_list.item(row).setText(
+                        f"[{self._status(msg, self._identities())}]  {Path(msg).name}")
+                    self.file_list.item(row).setToolTip(msg)
+                    self.file_list.blockSignals(False)
+                    self.open_pdf(self.files[row])
+                else:
+                    self.set_files([msg])
         else:
             self.say(f"✘ {msg}")
             QMessageBox.warning(self, "Not signed", msg)
 
 
-def run_gui(pdf: str | None = None):
+def run_gui(pdfs: list[str] | None = None):
     app = QApplication(sys.argv)
-    w = MainWindow(pdf)
+    w = MainWindow(pdfs)
     w.show()
     return app.exec_()
