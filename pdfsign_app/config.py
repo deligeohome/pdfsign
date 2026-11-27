@@ -74,6 +74,7 @@ class Settings:
     stamp_padding: int = 5        # pt between the stamp frame and its text
     field_radius: float = 120.0
     box_width: float = 160.0
+    merge_gap: float = 200.0
     box_height: float = 50.0
 
     @property
@@ -118,6 +119,7 @@ def load_settings(path: Path = CONFIG_FILE) -> Settings:
         stamp_padding=int(float(g("signature", "stamp_padding", "5") or 5)),
         field_radius=float(g("autolocate", "field_radius", "120") or 120),
         box_width=float(g("autolocate", "box_width", "160") or 160),
+        merge_gap=float(g("autolocate", "merge_gap", "200") or 0),
         box_height=float(g("autolocate", "box_height", "50") or 50),
     )
 

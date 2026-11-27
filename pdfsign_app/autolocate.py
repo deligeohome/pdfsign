@@ -87,6 +87,7 @@ class Location:
     order: int = 0
     cue: bool = False                  # signature line / label next to a "new" location
     space: bool = False                # cue is free signing space above a stand-alone name
+    merged: int = 1                    # number of side-by-side places sharing this signature
     drawn: bool = False                # "new" box is an empty rectangle drawn in the page
     anchor: str | None = None          # PDF edge of a proposed box that faces the text
 
@@ -107,6 +108,8 @@ class Location:
                         "new box next to the text" + (" (signature space above the name)" if self.space
                                                       else " (signature line found)" if self.cue else "")),
                 "mention": "text mention only, not used"}[self.status]
+        if self.merged > 1:
+            what += f" [{self.merged} adjacent places, one signature]"
         return f"page {self.page + 1}: \"{' / '.join(self.terms)}\" -> {what}"
 
 
@@ -115,10 +118,11 @@ class LocateOptions:
     field_radius: float = 120.0        # max distance text <-> signature field (pt)
     box_width: float = 160.0
     box_height: float = 50.0
+    merge_gap: float = 200.0           # side-by-side places closer than this share one signature
 
     @classmethod
     def from_settings(cls, s) -> "LocateOptions":
-        return cls(s.field_radius, s.box_width, s.box_height)
+        return cls(s.field_radius, s.box_width, s.box_height, getattr(s, "merge_gap", 200.0))
 
 
 def _page_words(page) -> list[_Word]:
@@ -298,6 +302,21 @@ def _place_box(page, anchor: pymupdf.Rect, words: list[_Word], taken: list[pymup
     return best, side
 
 
+def _side_by_side(a: pymupdf.Rect, b: pymupdf.Rect, words: list[_Word], max_gap: float) -> bool:
+    """Two places on the same text line with nothing but blank space between them
+    (e.g. your name under two neighbouring roles of a signature block)."""
+    v = min(a.y1, b.y1) - max(a.y0, b.y0)
+    if v < 0.5 * min(a.height, b.height):
+        return False
+    left, right = (a, b) if a.x0 <= b.x0 else (b, a)
+    gap = right.x0 - left.x1
+    if gap < 0 or gap > max_gap:
+        return False
+    band = pymupdf.Rect(left.x1, max(a.y0, b.y0), right.x0, min(a.y1, b.y1))
+    return not any(w.norm and band.intersects(w.rect) and w.rect.x0 >= left.x1 - 1 and w.rect.x1 <= right.x0 + 1
+                   for w in words)
+
+
 def _merge(cluster: list, rect: pymupdf.Rect, term: str) -> None:
     cluster[0] |= rect
     if term not in cluster[1]:
@@ -337,15 +356,42 @@ def find_locations(pdf_path: str, identities: Identities,
                         break
             widgets = [(wd.field_name, pymupdf.Rect(wd.rect))
                        for wd in page.widgets(types=[pymupdf.PDF_WIDGET_TYPE_SIGNATURE])]
+            # Side-by-side places (same line, only blank space between) get ONE signature,
+            # unless each already has its own empty field.
+            def own_empty(rect):
+                return {n for n, wr in widgets if not filled.get(n) and wr.get_area() > 0
+                        and _aligned(rect, wr) and _gap(rect, wr, xw=2.0) <= opts.field_radius}
+            if opts.merge_gap > 0:
+                for c in clusters:
+                    c.append(1)                # number of merged places
+                changed = True
+                while changed:
+                    changed = False
+                    for i in range(len(clusters)):
+                        for j in range(i + 1, len(clusters)):
+                            a, b = clusters[i], clusters[j]
+                            fa, fb = own_empty(a[0]), own_empty(b[0])
+                            if fa and fb and fa != fb:
+                                continue
+                            if _side_by_side(a[0], b[0], words, opts.merge_gap):
+                                for t in b[1]:
+                                    _merge(a, b[0], t)
+                                a[2] += b[2]
+                                del clusters[j]
+                                changed = True
+                                break
+                        if changed:
+                            break
             taken = [r for _, r in widgets]
             drawings = page.get_drawings() if clusters else []
             boxes = _drawn_boxes(drawings, words, taken)
             hlines = _hlines(drawings)
-            for rect, terms in clusters:
+            for rect, terms, *rest in clusters:
                 near = [(_gap(rect, wr, xw=2.0), n, wr) for n, wr in widgets
                         if _gap(rect, wr, xw=2.0) <= opts.field_radius and wr.get_area() > 0
                         and _aligned(rect, wr)]
-                loc = Location(page=page.number, text_rect=rect, terms=terms, status="new")
+                loc = Location(page=page.number, text_rect=rect, terms=terms, status="new",
+                               merged=rest[0] if rest else 1)
                 if near:
                     _, name, wr = min(near, key=lambda x: x[0])
                     loc.status = "signed" if filled.get(name) else "field"

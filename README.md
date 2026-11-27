@@ -108,6 +108,7 @@ cd pdfsign
 | `[signature] output_suffix` | `auto` | signed file name suffix: `_<initials>` from the certificate, or fixed text |
 | `[autolocate] field_radius` | `120` | max distance (pt) between your name and its signature field |
 | `[autolocate] box_width/height` | `160` / `50` | size of a proposed new box |
+| `[autolocate] merge_gap` | `200` | side-by-side places closer than this share one signature (0 = off) |
 
 `credentials.ini` (git-ignored; must be `chmod 600`; or point `$PDFSIGN_CREDENTIALS` elsewhere):
 ```ini
@@ -149,6 +150,9 @@ A diagonal box is typically the slot of the next label, e.g. the director's box 
 * A bare mention of your name (e.g. in a member list or a "NAME: …" line) is ignored when the
   document has a better candidate: a nearby signature field, a signature line / "Signature" label,
   or a name standing alone with free signing space above it (a typical signature block).
+* **Side-by-side places** (your name on the same line under two neighbouring roles, e.g. traveller and
+  project supervisor, with only blank space between) get **one** signature centred between them,
+  unless each already has its own empty field. `[autolocate] merge_gap` (default 200 pt; 0 = off).
 * If several unsigned places remain, you are asked whether to sign the **first** one or **all** of them
   (GUI dialog, CLI prompt, or `--first` / `--all`). "All" uses one login and adds one signature per place.
 * **Multi-step forms**: each run signs the next unsigned step. Already-signed steps are recognised
