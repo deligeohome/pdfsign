@@ -70,6 +70,8 @@ class Settings:
     font: str
     font_size: int
     stamp_border: str = "auto"    # auto | yes | no
+    output_suffix: str = "auto"   # auto = _<initials from certificate>, or literal text
+    stamp_padding: int = 5        # pt between the stamp frame and its text
     field_radius: float = 120.0
     box_width: float = 160.0
     box_height: float = 50.0
@@ -112,6 +114,8 @@ def load_settings(path: Path = CONFIG_FILE) -> Settings:
         font=font,
         font_size=int(g("signature", "font_size", "9") or 9),
         stamp_border=(g("signature", "stamp_border", "auto") or "auto").lower(),
+        output_suffix=g("signature", "output_suffix", "auto"),
+        stamp_padding=int(float(g("signature", "stamp_padding", "5") or 5)),
         field_radius=float(g("autolocate", "field_radius", "120") or 120),
         box_width=float(g("autolocate", "box_width", "160") or 160),
         box_height=float(g("autolocate", "box_height", "50") or 50),

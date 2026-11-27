@@ -19,7 +19,7 @@ from PyQt5.QtWidgets import (
 
 from .autolocate import LocateOptions, find_locations, select
 from .config import FAILURE_MARKER, ConfigError, load_settings, read_identities
-from .signing import SignRequest, list_signature_fields
+from .signing import SignRequest, default_output, list_signature_fields, output_suffix
 from .token import PinState, Token, WrongPinError
 from .workflow import Cancelled, sign_with_token
 
@@ -304,6 +304,7 @@ class MainWindow(QMainWindow):
     def refresh_token(self):
         try:
             t = Token.from_settings(self.settings)
+            self.cert = t.certificate
             st = t.pin_state()
             txt = f"<b>{t.signer_name}</b><br>{t.certificate.issuer.native.get('common_name', '')}<br>{st.describe()}"
             if st.count_low or st.locked:
@@ -467,8 +468,8 @@ class MainWindow(QMainWindow):
         elif self.mode_field.isChecked():
             field = self.field_combo.currentText()
         src = Path(self.path)
-        out, _ = QFileDialog.getSaveFileName(self, "Save signed PDF as",
-                                             str(src.with_name(src.stem + "_signed.pdf")), "PDF (*.pdf)")
+        suggested = default_output(self.path, output_suffix(self.settings, getattr(self, "cert", None)))
+        out, _ = QFileDialog.getSaveFileName(self, "Save signed PDF as", suggested, "PDF (*.pdf)")
         if not out:
             return
         if Path(out).resolve() == src.resolve():

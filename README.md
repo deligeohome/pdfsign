@@ -102,6 +102,8 @@ cd pdfsign
 | `[signature] stamp_text` | … | `%(signer)s` and `%(ts)s` placeholders |
 | `[signature] font` | `auto` | TTF/OTF with **1000 units/em** (e.g. Noto Sans) |
 | `[signature] stamp_border` | `auto` | frame around the stamp: only for new boxes (`auto`), `yes`, `no` |
+| `[signature] stamp_padding` | `5` | space (pt) between frame and text; proposed boxes shrink to fit the stamp |
+| `[signature] output_suffix` | `auto` | signed file name suffix: `_<initials>` from the certificate, or fixed text |
 | `[autolocate] field_radius` | `120` | max distance (pt) between your name and its signature field |
 | `[autolocate] box_width/height` | `160` / `50` | size of a proposed new box |
 
@@ -168,10 +170,12 @@ box, then click *Sign PDF…*. After signing, *Load here (next step)* opens the 
 ./pdfsign sign doc.pdf --page 1 --box 350,50,560,120 --reason "Approved" --location "Heraklion"
 ./pdfsign sign doc.pdf --invisible --ask                  # ignore stored secret, prompt
 ./pdfsign sign doc.pdf --invisible --secret-type pin      # unlock with a numeric PIN this time
-./pdfsign verify doc_signed.pdf
+./pdfsign verify doc_MP.pdf
 ```
 `--box` is `x1,y1,x2,y2` in PDF points, origin bottom-left (A4 = 595 × 842). The output defaults to
-`<name>_signed.pdf`.
+`<name>_<initials>.pdf`, with the initials taken from your certificate (e.g. `report_MP.pdf`). A file
+that already carries the suffix is not suffixed twice, and existing files get `-2`, `-3`, …
+(`[signature] output_suffix`).
 
 ## Notes and limitations
 

@@ -19,10 +19,13 @@ Bare mentions are only used when the document has nothing better; otherwise they
 as "mention". Tier-2 locations are never dropped, so the remaining steps of a field-less
 multi-step form stay available after the first step has been signed.
 Matching ignores case, accents and punctuation; multi-word entries must be adjacent words.
+Names match in any word order ("Maria Papadopoulou" = "PAPADOPOULOU MARIA", the usual order
+in Greek administrative forms); roles must keep their word order.
 """
 
 from __future__ import annotations
 
+import itertools
 import math
 import re
 import unicodedata
@@ -83,6 +86,7 @@ class Location:
     order: int = 0
     cue: bool = False                  # signature line / label next to a "new" location
     drawn: bool = False                # "new" box is an empty rectangle drawn in the page
+    anchor: str | None = None          # PDF edge of a proposed box that faces the text
 
     @property
     def unsigned(self) -> bool:
@@ -91,7 +95,8 @@ class Location:
     def placement(self) -> Placement:
         if self.status == "field":
             return Placement(field_name=self.field_name, page=self.page, box=None)
-        return Placement(field_name=None, page=self.page, box=self.box_pdf, frame=not self.drawn)
+        return Placement(field_name=None, page=self.page, box=self.box_pdf, frame=not self.drawn,
+                         fit=None if self.drawn else self.anchor)
 
     def describe(self) -> str:
         what = {"field": f"empty field '{self.field_name}'",
@@ -187,18 +192,21 @@ def _adjacent(a: pymupdf.Rect, b: pymupdf.Rect) -> bool:
     return same_line or next_line
 
 
-def _find(words: list[_Word], term: str) -> list[pymupdf.Rect]:
+def _find(words: list[_Word], term: str, any_order: bool = False) -> list[pymupdf.Rect]:
     toks = _tokens(term)
     if not toks:
         return []
+    orders = (set(itertools.permutations(toks)) if any_order and len(toks) <= 4 else {tuple(toks)})
     hits = []
     for i in range(len(words) - len(toks) + 1):
-        if all(words[i + j].norm == t for j, t in enumerate(toks)) and all(
-                _adjacent(words[i + j - 1].rect, words[i + j].rect) for j in range(1, len(toks))):
+        if not any(all(words[i + j].norm == t for j, t in enumerate(o)) for o in orders):
+            continue
+        if all(_adjacent(words[i + j - 1].rect, words[i + j].rect) for j in range(1, len(toks))):
             r = pymupdf.Rect(words[i].rect)
             for j in range(1, len(toks)):
                 r |= words[i + j].rect
-            hits.append(r)
+            if r not in hits:
+                hits.append(r)
     return hits
 
 
@@ -227,18 +235,32 @@ def _place_box(page, anchor: pymupdf.Rect, words: list[_Word], taken: list[pymup
         top = max(blockers) + 2
         if above.y1 - top >= 28:
             cands[0] = pymupdf.Rect(above.x0, top, above.x1, above.y1)
+    # Above/below boxes: stay inside the identity's column - do not reach into the text of a
+    # neighbouring name on the same line (multi-column signature blocks).
+    same_line = [t for t in text if min(t.y1, anchor.y1) - max(t.y0, anchor.y0) > 0]
+    left = max((t.x1 for t in same_line if t.x1 <= anchor.x0), default=None)
+    right = min((t.x0 for t in same_line if t.x0 >= anchor.x1), default=None)
+    for i in (0, 2):
+        c = cands[i]
+        # split the gap to a neighbour halfway, so adjacent signature boxes never collide
+        x0 = max(c.x0, (left + anchor.x0) / 2 + 2) if left is not None else c.x0
+        x1 = min(c.x1, (anchor.x1 + right) / 2 - 2) if right is not None else c.x1
+        if x1 - x0 >= 60:
+            cands[i] = pymupdf.Rect(x0, c.y0, x1, c.y1)
     # Side boxes: fit between the text / table rules above and below the identity text.
     for i in (1, 3):
         cands[i] = _fit_vertical(cands[i], cy, text + list(hlines))
-    best, best_score = cands[0], math.inf
+    best, best_score, best_i = cands[0], math.inf, 0
     for i, c in enumerate(cands):
         if not area.contains(c) or any(not (c & t).is_empty for t in taken):
             continue
         overlap = sum((c & t).get_area() for t in text if not (c & t).is_empty)
         score = overlap + i * 1.0
         if score < best_score:
-            best, best_score = c, score
-    return best
+            best, best_score, best_i = c, score, i
+    # edge of the box (PDF orientation, y up) that faces the identity text
+    side = ("bottom", "left", "top", "right")[best_i] if page.rotation == 0 else "center"
+    return best, side
 
 
 def _merge(cluster: list, rect: pymupdf.Rect, term: str) -> None:
@@ -258,7 +280,7 @@ def find_locations(pdf_path: str, identities: Identities,
         pages = []
         for page in doc:
             words = _page_words(page)
-            prim = [(r, t) for t in identities.names for r in _find(words, t)]
+            prim = [(r, t) for t in identities.names for r in _find(words, t, any_order=True)]
             sec = [(r, t) for t in identities.roles for r in _find(words, t)]
             pages.append((page, words, prim, sec))
 
@@ -301,8 +323,8 @@ def find_locations(pdf_path: str, identities: Identities,
                         box = pymupdf.Rect(min(drawn, key=lambda x: x[0])[1])
                         loc.drawn = loc.cue = True
                     else:
-                        box = _place_box(page, rect, words, taken, opts.box_width, opts.box_height,
-                                         hlines)
+                        box, loc.anchor = _place_box(page, rect, words, taken, opts.box_width,
+                                                     opts.box_height, hlines)
                         loc.cue = _has_cue(page, words, rect)
                     taken.append(box)
                     loc.box = box

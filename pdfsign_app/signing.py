@@ -13,7 +13,8 @@ from asn1crypto import x509 as asn1_x509
 from pyhanko.pdf_utils.font.opentype import GlyphAccumulatorFactory
 from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
 from pyhanko.pdf_utils.reader import PdfFileReader
-from pyhanko.pdf_utils.text import TextBoxStyle
+from pyhanko.pdf_utils import layout
+from pyhanko.pdf_utils.text import DEFAULT_BOX_LAYOUT, TextBoxStyle
 from pyhanko.sign import fields, signers, timestamps
 from pyhanko.sign.fields import SigFieldSpec, SigSeedSubFilter
 from pyhanko.sign.signers.pdf_cms import Signer
@@ -59,6 +60,35 @@ def validation_context(chain: list, extra_roots=()) -> ValidationContext:
     roots = [c for c in chain if c.self_signed in ("maybe", "yes")] + list(extra_roots)
     others = [c for c in chain if c not in roots]
     return ValidationContext(trust_roots=roots, other_certs=others, allow_fetching=True)
+
+
+# ------------------------------------------------------------------ output name
+def initials(cert: asn1_x509.Certificate) -> str:
+    """GN + SN initials from the certificate subject (MARIA PAPADOPOULOU -> MP)."""
+    subj = cert.subject.native
+    parts = [subj.get("given_name"), subj.get("surname")]
+    if not all(parts):
+        parts = str(subj.get("common_name", "")).split()
+    letters = "".join(p.strip()[0] for p in parts if p and p.strip())
+    return letters.upper() or "SIGNED"
+
+
+def output_suffix(settings: Settings, cert: asn1_x509.Certificate | None) -> str:
+    s = (settings.output_suffix or "").strip()
+    if s.lower() == "auto":
+        return f"_{initials(cert)}" if cert is not None else "_signed"
+    return s or "_signed"
+
+
+def default_output(input_pdf: str, suffix: str) -> str:
+    """<stem><suffix>.pdf next to the input; never the input itself, never an existing file.
+    A file that already ends with the suffix (next step of a form) is not suffixed twice."""
+    src = Path(input_pdf)
+    stem = src.stem if src.stem.endswith(suffix) else src.stem + suffix
+    cand, n = src.with_name(stem + ".pdf"), 2
+    while cand.exists() or cand.resolve() == src.resolve():
+        cand, n = src.with_name(f"{stem}-{n}.pdf"), n + 1
+    return str(cand)
 
 
 # ------------------------------------------------------------------ signer
@@ -109,6 +139,7 @@ class Placement:
     page: int = 0
     box: tuple | None = None
     frame: bool = True       # draw a frame around a NEW box (False: the page already draws one)
+    fit: str | None = None   # shrink a NEW box to the stamp, keeping this edge (bottom/top/left/right/center)
 
 
 def _border(settings: Settings, new_field, frame: bool | None = None) -> int:
@@ -119,6 +150,25 @@ def _border(settings: Settings, new_field, frame: bool | None = None) -> int:
     if mode in ("no", "false", "0", "off"):
         return 0
     return 1 if new_field is not None and frame is not False else 0
+
+
+def _stamp_size(style: TextStampStyle, signer_name: str) -> tuple[float, float]:
+    """Natural size of the stamp (text + padding) in points."""
+    from pyhanko.pdf_utils.writer import PdfFileWriter
+    from pyhanko.stamp import TextStamp
+    st = TextStamp(PdfFileWriter(), style, text_params={"signer": signer_name})
+    st.render()
+    return st.box.width, st.box.height
+
+
+def _fit_box(box: tuple, size: tuple[float, float], edge: str) -> tuple:
+    """Shrink box (x1, y1, x2, y2, PDF y-up) to size, keeping the given edge; never grow it."""
+    x1, y1, x2, y2 = box
+    w, h = min(size[0] + 2, x2 - x1), min(size[1] + 2, y2 - y1)   # +2: room for the frame line
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    nx1 = x1 if edge == "left" else x2 - w if edge == "right" else cx - w / 2
+    ny1 = y1 if edge == "bottom" else y2 - h if edge == "top" else cy - h / 2
+    return (nx1, ny1, nx1 + w, ny1 + h)
 
 
 def _font_usable(path: str, log) -> bool:
@@ -142,6 +192,7 @@ class SignRequest:
     page: int = 0                          # 0-based page for a NEW field
     box: tuple | None = None               # (x1, y1, x2, y2) PDF user-space points; None = invisible
     frame: bool | None = None              # frame around a new box (None = default)
+    fit: str | None = None                 # shrink the new box to the stamp (see Placement.fit)
     reason: str = ""
     location: str = ""
     contact: str = ""
@@ -154,6 +205,15 @@ def sign_pdf(req: SignRequest, signer: Signer, settings: Settings, chain: list,
     if inp == out:
         raise ValueError("Output must differ from input (the original is never overwritten).")
 
+    # space between the frame and the text (pyHanko's default is 10 pt)
+    padding = DEFAULT_BOX_LAYOUT.substitute_margins(layout.Margins.uniform(settings.stamp_padding))
+    text_style = TextBoxStyle(box_layout_rule=padding)
+    if settings.font:
+        if _font_usable(settings.font, log):
+            text_style = TextBoxStyle(font=GlyphAccumulatorFactory(settings.font, settings.font_size),
+                                      font_size=settings.font_size, box_layout_rule=padding)
+        else:
+            log("Using the built-in stamp font (Latin only).")
     existing = {f.name: f for f in list_signature_fields(str(inp))}
     new_field = None
     if req.field_name and req.field_name in existing:
@@ -164,7 +224,13 @@ def sign_pdf(req: SignRequest, signer: Signer, settings: Settings, chain: list,
         field_name = req.field_name or _unique_field_name(str(inp))
         new_field = SigFieldSpec(sig_field_name=field_name, on_page=req.page,
                                  box=tuple(req.box) if req.box else None)
-
+    style = TextStampStyle(stamp_text=settings.stamp_text,
+                           timestamp_format=settings.timestamp_format,
+                           text_box_style=text_style, border_width=_border(settings, new_field, req.frame))
+    if new_field is not None and req.box and req.fit:
+        # proposed box: hug the stamp so the frame sits close to the text
+        box = _fit_box(tuple(req.box), _stamp_size(style, signer.subject_name or ""), req.fit)
+        new_field = SigFieldSpec(sig_field_name=field_name, on_page=req.page, box=box)
     lt = req.level in ("B-LT", "B-LTA")
     meta = signers.PdfSignatureMetadata(
         field_name=field_name,
@@ -177,16 +243,6 @@ def sign_pdf(req: SignRequest, signer: Signer, settings: Settings, chain: list,
         use_pades_lta=req.level == "B-LTA",
         validation_context=validation_context(chain, extra_roots) if lt else None,
     )
-    text_style = TextBoxStyle()
-    if settings.font:
-        if _font_usable(settings.font, log):
-            text_style = TextBoxStyle(font=GlyphAccumulatorFactory(settings.font, settings.font_size),
-                                      font_size=settings.font_size)
-        else:
-            log("Using the built-in stamp font (Latin only).")
-    style = TextStampStyle(stamp_text=settings.stamp_text,
-                           timestamp_format=settings.timestamp_format,
-                           text_box_style=text_style, border_width=_border(settings, new_field, req.frame))
     tsa = timestamps.HTTPTimeStamper(settings.tsa_url, timeout=30)
     pdf_signer = signers.PdfSigner(meta, signer=signer, timestamper=tsa,
                                    stamp_style=style, new_field_spec=new_field)

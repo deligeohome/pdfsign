@@ -77,7 +77,7 @@ def _sign_chain(req: SignRequest, placements: list[Placement], signer, settings,
                 temps.append(dst)
             log(f"--- signature {i}/{len(placements)} (page {p.page + 1})")
             sign_pdf(replace(req, input_pdf=src, output_pdf=dst, field_name=p.field_name,
-                             page=p.page, box=p.box, frame=p.frame), signer, settings, chain, log=log)
+                             page=p.page, box=p.box, frame=p.frame, fit=p.fit), signer, settings, chain, log=log)
             src = dst
     finally:
         for t in temps:

@@ -9,7 +9,8 @@ from pathlib import Path
 
 from .autolocate import LocateOptions, find_locations, select
 from .config import FAILURE_MARKER, ConfigError, load_settings, read_identities
-from .signing import SignRequest, fetch_chain, list_signature_fields, verify_pdf
+from .signing import (SignRequest, default_output, fetch_chain, list_signature_fields,
+                      output_suffix, verify_pdf)
 from .token import PinState, Token, TokenError
 from .workflow import Cancelled, sign_with_token
 
@@ -45,6 +46,8 @@ def cmd_info(args, s):
 
 
 def cmd_fields(args, s):
+    if not Path(args.pdf).is_file():
+        sys.exit(f"File not found: {args.pdf}")
     fs = list_signature_fields(args.pdf)
     if not fs:
         print("No signature fields.")
@@ -96,7 +99,17 @@ def cmd_sign(args, s):
     box = tuple(float(v) for v in args.box.split(",")) if args.box else None
     if box and len(box) != 4:
         sys.exit("--box needs x1,y1,x2,y2 (PDF points, origin bottom-left)")
-    out = args.output or str(Path(args.pdf).with_name(Path(args.pdf).stem + "_signed.pdf"))
+    if not Path(args.pdf).is_file():
+        sys.exit(f"File not found: {args.pdf}")
+    if args.output:
+        out = args.output
+    else:
+        try:
+            cert = Token.from_settings(s).certificate      # public data only, no PIN
+        except TokenError:
+            cert = None
+        out = default_output(args.pdf, output_suffix(s, cert))
+    print(f"Output: {out}")
     req = SignRequest(args.pdf, out, field_name=args.field, page=args.page - 1,
                       box=None if args.invisible else box,
                       reason=args.reason if args.reason is not None else s.reason,
