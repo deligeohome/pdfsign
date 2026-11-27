@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Launcher: runs pdfsign from its virtualenv (kept outside the synced folder for size).
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+VENV="${PDFSIGN_VENV:-$HOME/.local/share/pdfsign/venv}"
+if [ ! -x "$VENV/bin/python" ]; then
+    echo "Virtualenv missing - run: $HERE/install.sh" >&2
+    exit 1
+fi
+export PYTHONDONTWRITEBYTECODE=1   # no __pycache__ clutter in the program folder
+export OPENSC_CONF="$HERE/opensc-pdfsign.conf"
+PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}" exec "$VENV/bin/python" -m pdfsign_app.cli "$@"

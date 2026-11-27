@@ -1,0 +1,21 @@
+# Secrets / local state - never commit
+credentials.ini
+*.ini.bak
+.pin_failure.lock
+*.key
+*.p12
+*.pfx
+
+# Environments / caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Signed outputs and test documents
+*_signed.pdf
+
+# Personal / local files
+*.pdf
+certs/
+dmesg*.txt
