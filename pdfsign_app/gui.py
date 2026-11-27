@@ -9,7 +9,7 @@ import traceback
 from pathlib import Path
 
 import pymupdf
-from PyQt5.QtCore import QObject, QPointF, QRectF, Qt, QThread, pyqtSignal
+from PyQt5.QtCore import QElapsedTimer, QObject, QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAction, QApplication, QButtonGroup, QComboBox, QFileDialog, QFormLayout, QGroupBox,
@@ -28,6 +28,38 @@ MIN_BOX_PT = 20  # smallest accepted signature box (points)
 
 
 # ---------------------------------------------------------------------- page view
+class PageScroll(QScrollArea):
+    """Scroll area that turns the page when you keep scrolling past its top or bottom.
+
+    One extra wheel notch (or the same amount of touchpad scrolling) at the edge is needed, and
+    pages turn at most every 350 ms, so a fast flick does not race through the document."""
+    pageStep = pyqtSignal(int)            # +1 next page, -1 previous page
+
+    def __init__(self):
+        super().__init__()
+        self._acc = 0
+        self._last = QElapsedTimer()
+        self._last.start()
+
+    def wheelEvent(self, ev):
+        dy = ev.angleDelta().y()
+        if ev.modifiers() & Qt.ControlModifier or dy == 0:
+            return super().wheelEvent(ev)
+        sb = self.verticalScrollBar()
+        at_edge = (dy < 0 and sb.value() >= sb.maximum()) or (dy > 0 and sb.value() <= sb.minimum())
+        if not at_edge:
+            self._acc = 0
+            return super().wheelEvent(ev)
+        if self._acc and (self._acc > 0) != (dy > 0):
+            self._acc = 0                 # direction changed
+        self._acc += dy
+        if abs(self._acc) >= 120 and self._last.elapsed() > 350:
+            self.pageStep.emit(-1 if self._acc > 0 else 1)
+            self._acc = 0
+            self._last.restart()
+        ev.accept()
+
+
 class PageView(QLabel):
     boxDrawn = pyqtSignal(QRectF)      # display-space rect, in points
     fieldClicked = pyqtSignal(str)
@@ -242,9 +274,10 @@ class MainWindow(QMainWindow):
         self.view = PageView()
         self.view.boxDrawn.connect(self.on_box)
         self.view.fieldClicked.connect(self.on_field_clicked)
-        scroll = QScrollArea()
+        self.scroll = scroll = PageScroll()
         scroll.setWidget(self.view)
         scroll.setAlignment(Qt.AlignCenter)
+        scroll.pageStep.connect(self.turn_page)
 
         side = QWidget()
         sv = QVBoxLayout(side)
@@ -454,6 +487,15 @@ class MainWindow(QMainWindow):
         else:
             self.mode_draw.setChecked(True)
             self.goto(0)
+
+    def turn_page(self, step: int):
+        """Scrolled past the page edge: next page starts at its top, previous at its bottom."""
+        n = self.page_no + step
+        if not self.doc or not 0 <= n < self.doc.page_count:
+            return
+        self.goto(n)
+        sb = self.scroll.verticalScrollBar()
+        QTimer.singleShot(0, lambda: sb.setValue(sb.minimum() if step > 0 else sb.maximum()))
 
     def goto(self, n: int):
         if not self.doc or not 0 <= n < self.doc.page_count:
